@@ -187,11 +187,7 @@ class StateManager(private val project: Project) {
     fun setEnabled(value: Boolean) {
         _enabled = value
         if (value) {
-            ensureGit()?.let { g ->
-                g.initGit()
-                val merged = mergeDefaultSettings(g)
-                _settings = merged
-            }
+            ensureGit() // just create the HunkwiseGit instance, don't init yet
         } else {
             state.clear()
             _git?.destroyGit()
@@ -203,8 +199,13 @@ class StateManager(private val project: Project) {
      * Snapshot all workspace files as baselines. Called after enable.
      */
     fun snapshotWorkspace(shouldIgnore: (String, Boolean) -> Boolean) {
-        val g = _git ?: return
+        val g = ensureGit() ?: return
         val root = _workspaceRoot ?: return
+
+        // Init git if not yet done (safe to call from background thread)
+        g.initGit()
+        val merged = mergeDefaultSettings(g)
+        _settings = merged
 
         val files = collectFiles(root, shouldIgnore)
         val batch = files.mapNotNull { fp ->
@@ -292,7 +293,7 @@ class StateManager(private val project: Project) {
         log.info("rebuildState: begin")
 
         // Wait for pending git ops
-        runBlocking { gitJob.join() }
+        waitForGitQueue()
 
         state.clear()
         g.initGit()
@@ -406,7 +407,7 @@ class StateManager(private val project: Project) {
         }
 
         // Wait for git ops
-        runBlocking { gitJob.join() }
+        waitForGitQueue()
     }
 
     /**
@@ -453,7 +454,7 @@ class StateManager(private val project: Project) {
             }
         }
 
-        runBlocking { gitJob.join() }
+        waitForGitQueue()
     }
 
     fun resetToDisabled() {
@@ -465,7 +466,7 @@ class StateManager(private val project: Project) {
     }
 
     fun flush() {
-        runBlocking { gitJob.join() }
+        waitForGitQueue()
     }
 
     // ── notification ─────────────────────────────────────────────────────
@@ -485,6 +486,20 @@ class StateManager(private val project: Project) {
             _git = HunkwiseGit(dir, root)
         }
         return _git
+    }
+
+    /**
+     * Wait for pending git operations. Safe to call from any thread.
+     * Uses a CountDownLatch to avoid runBlocking on EDT.
+     */
+    private fun waitForGitQueue() {
+        val latch = java.util.concurrent.CountDownLatch(1)
+        enqueueGit { latch.countDown() }
+        try {
+            latch.await(30, java.util.concurrent.TimeUnit.SECONDS)
+        } catch (_: InterruptedException) {
+            // timeout — proceed anyway
+        }
     }
 
     private fun enqueueGit(action: suspend () -> Unit) {

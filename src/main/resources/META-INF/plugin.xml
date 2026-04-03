@@ -13,7 +13,7 @@
         <postStartupActivity implementation="com.hunkwise.HunkwisePlugin"/>
         <postStartupActivity implementation="com.hunkwise.editor.HunkEditorListener"/>
         <toolWindow id="Hunkwise"
-                    anchor="bottom"
+                    anchor="right"
                     secondary="false"
                     factoryClass="com.hunkwise.toolwindow.HunkwiseToolWindowFactory"
                     icon="/icons/hunkwise13.svg"/>
