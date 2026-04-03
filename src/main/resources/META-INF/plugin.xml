@@ -1,0 +1,64 @@
+<idea-plugin>
+    <id>com.hunkwise</id>
+    <name>Hunkwise</name>
+    <vendor>hunkwise</vendor>
+    <description><![CDATA[
+        Per-hunk accept/discard review for file changes made by external tools (AI coding assistants, scripts, etc.).
+        Similar to hunkwise for VS Code, but native to IntelliJ IDEA.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <postStartupActivity implementation="com.hunkwise.HunkwisePlugin"/>
+        <postStartupActivity implementation="com.hunkwise.editor.HunkEditorListener"/>
+        <toolWindow id="Hunkwise"
+                    anchor="bottom"
+                    secondary="false"
+                    factoryClass="com.hunkwise.toolwindow.HunkwiseToolWindowFactory"
+                    icon="/icons/hunkwise13.svg"/>
+    </extensions>
+
+    <actions>
+        <group id="Hunkwise.Actions" text="Hunkwise" popup="true">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+            <action id="Hunkwise.Enable"
+                    class="com.hunkwise.actions.EnableAction"
+                    text="Enable Hunkwise"
+                    description="Enable hunkwise tracking for this project"/>
+            <action id="Hunkwise.Disable"
+                    class="com.hunkwise.actions.DisableAction"
+                    text="Disable Hunkwise"
+                    description="Disable hunkwise tracking"/>
+            <action id="Hunkwise.Refresh"
+                    class="com.hunkwise.actions.RefreshAction"
+                    text="Refresh"
+                    description="Rebuild hunkwise state from disk"/>
+            <separator/>
+            <action id="Hunkwise.AcceptHunk"
+                    class="com.hunkwise.actions.AcceptHunkAction"
+                    text="Accept Hunk"
+                    description="Accept the current hunk"/>
+            <action id="Hunkwise.DiscardHunk"
+                    class="com.hunkwise.actions.DiscardHunkAction"
+                    text="Discard Hunk"
+                    description="Discard the current hunk"/>
+            <action id="Hunkwise.AcceptFile"
+                    class="com.hunkwise.actions.AcceptFileAction"
+                    text="Accept File"
+                    description="Accept all hunks in the current file"/>
+            <action id="Hunkwise.DiscardFile"
+                    class="com.hunkwise.actions.DiscardFileAction"
+                    text="Discard File"
+                    description="Discard all hunks in the current file"/>
+            <action id="Hunkwise.AcceptAll"
+                    class="com.hunkwise.actions.AcceptAllAction"
+                    text="Accept All"
+                    description="Accept all hunks in all files"/>
+            <action id="Hunkwise.DiscardAll"
+                    class="com.hunkwise.actions.DiscardAllAction"
+                    text="Discard All"
+                    description="Discard all hunks in all files"/>
+        </group>
+    </actions>
+</idea-plugin>
