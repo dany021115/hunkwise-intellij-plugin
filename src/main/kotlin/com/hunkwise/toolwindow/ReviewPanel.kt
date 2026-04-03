@@ -391,8 +391,8 @@ class ReviewPanel(private val project: Project) : JBPanel<ReviewPanel>(BorderLay
             return
         }
 
-        // Build context: include current hunks diff if user asks about changes
-        val contextMsg = buildContextualMessage(msg)
+        // Build message with conversation history for context
+        val contextMsg = buildMessageWithHistory(msg)
         val systemPrompt = claudeService.buildSystemPrompt()
 
         isSending = true
@@ -540,8 +540,30 @@ $diffSummary"""
         }
     }
 
-    /** Build message with hunk context if user asks about changes */
-    private fun buildContextualMessage(msg: String): String {
+    /**
+     * Build message with conversation history so Claude has context.
+     * Includes last N messages + hunk context if relevant.
+     */
+    private fun buildMessageWithHistory(msg: String): String {
+        val session = sessionManager.getCurrentSession()
+        val recentMessages = session.messages
+            .filter { it.sender == "You" || it.sender == "Claude" }
+
+        val sb = StringBuilder()
+
+        // Include full conversation history — no truncation, let Claude manage its context
+        if (recentMessages.size > 1) {
+            sb.appendLine("<conversation_history>")
+            for (m in recentMessages.dropLast(1)) {
+                val role = if (m.sender == "You") "User" else "Assistant"
+                sb.appendLine("$role: ${m.text}")
+                sb.appendLine()
+            }
+            sb.appendLine("</conversation_history>")
+            sb.appendLine()
+        }
+
+        // Add hunk context if user asks about changes
         val lowerMsg = msg.lowercase()
         val needsContext = lowerMsg.contains("cambio") || lowerMsg.contains("change") ||
             lowerMsg.contains("hunk") || lowerMsg.contains("diff") ||
@@ -549,10 +571,15 @@ $diffSummary"""
             lowerMsg.contains("seguro") || lowerMsg.contains("safe") ||
             lowerMsg.contains("review") || lowerMsg.contains("revisa")
 
-        if (!needsContext || cachedFiles.isEmpty()) return msg
+        if (needsContext && cachedFiles.isNotEmpty()) {
+            sb.appendLine("<uncommitted_changes>")
+            sb.append(buildFullDiffContext())
+            sb.appendLine("</uncommitted_changes>")
+            sb.appendLine()
+        }
 
-        val context = buildFullDiffContext()
-        return "$msg\n\nHere are the current uncommitted changes:\n$context"
+        sb.append(msg)
+        return sb.toString()
     }
 
     private fun buildFullDiffContext(): String {
@@ -579,8 +606,9 @@ $diffSummary"""
         if (status.isEmpty()) { clearActivity(); return }
 
         val doc = chatPane.styledDocument
+
+        // If we already have activity text, replace it
         if (activityOffset >= 0) {
-            // Replace existing activity text
             try {
                 doc.remove(activityOffset, doc.length - activityOffset)
             } catch (_: Exception) {}
@@ -588,12 +616,13 @@ $diffSummary"""
             activityOffset = doc.length
         }
 
-        val s = chatPane.addStyle("activity_${doc.length}", null)
-        StyleConstants.setForeground(s, Color(0x10, 0xB9, 0x81)) // green
-        StyleConstants.setFontSize(s, 11)
-        StyleConstants.setFontFamily(s, "JetBrains Mono")
-        StyleConstants.setItalic(s, true)
-        doc.insertString(doc.length, "\n$status", s)
+        // Activity line: dim background bar with tool icon
+        val barStyle = chatPane.addStyle("act_bar_${doc.length}", null)
+        StyleConstants.setForeground(barStyle, Color(0x10, 0xB9, 0x81))
+        StyleConstants.setFontSize(barStyle, 11)
+        StyleConstants.setFontFamily(barStyle, "JetBrains Mono")
+        StyleConstants.setItalic(barStyle, true)
+        doc.insertString(doc.length, "\n$status", barStyle)
         chatPane.caretPosition = doc.length
     }
 
@@ -616,6 +645,7 @@ $diffSummary"""
         val doc = chatPane.styledDocument
         if (doc.length > 0) doc.insertString(doc.length, "\n\n", null)
 
+        // "Claude" sender label
         val s = chatPane.addStyle("stream_sender", null)
         StyleConstants.setBold(s, true)
         StyleConstants.setForeground(s, Color(0xCE, 0x91, 0x78))
@@ -629,6 +659,7 @@ $diffSummary"""
 
     private fun appendStreamToken(token: String) {
         streamingBuffer.append(token)
+        // Show raw text while streaming (no markdown yet)
         val doc = chatPane.styledDocument
         val s = chatPane.addStyle("stream_${doc.length}", null)
         StyleConstants.setForeground(s, FG)
@@ -639,10 +670,21 @@ $diffSummary"""
     }
 
     private fun finishStreaming() {
-        // Save the full streamed response to session history
         val fullText = streamingBuffer.toString()
         if (fullText.isNotBlank()) {
+            // Save to session
             sessionManager.addMessage("Claude", fullText)
+
+            // Re-render with markdown formatting:
+            // Remove the raw streamed text, replace with formatted version
+            try {
+                val doc = chatPane.styledDocument
+                if (streamingStartOffset >= 0 && streamingStartOffset <= doc.length) {
+                    doc.remove(streamingStartOffset, doc.length - streamingStartOffset)
+                    MarkdownRenderer.render(chatPane, fullText, FG)
+                    chatPane.caretPosition = doc.length
+                }
+            } catch (_: Exception) {}
         }
         streamingBuffer.clear()
         streamingStartOffset = -1

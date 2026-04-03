@@ -63,13 +63,18 @@ class ClaudeCodeService(private val project: Project) {
             }
         }?.distinct()?.joinToString(", ") ?: ""
 
-        return """You are reviewing code changes in an IntelliJ IDEA project.
+        return """You are a code review assistant in an IntelliJ IDEA project.
 Project: ${java.io.File(root).name}
 Branch: $branch
 Languages: $langs
 Root: $root
-You can see uncommitted git changes. Help the user understand, review, and decide on changes.
-When reviewing hunks, explain what changed and whether it's safe to accept."""
+
+RULES:
+- Always respond in the same language the user writes in. Match their language automatically.
+- You can see uncommitted git changes. Help the user understand, review, and decide on changes.
+- When reviewing hunks, explain what changed and whether it's safe to accept.
+- Be concise and direct. Avoid excessive markdown formatting.
+- Remember context from previous messages in this conversation."""
     }
 
     /**
@@ -89,7 +94,7 @@ When reviewing hunks, explain what changed and whether it's safe to accept."""
             return
         }
 
-        val cmd = mutableListOf(claude, "-p", "--output-format", "stream-json", "--verbose")
+        val cmd = mutableListOf(claude, "-p", "--output-format", "stream-json", "--verbose", "--effort", "high")
         if (shouldContinue) {
             // Continue existing session — do NOT pass system prompt (it forces new session)
             cmd.add("--continue")
@@ -189,6 +194,21 @@ When reviewing hunks, explain what changed and whether it's safe to accept."""
                                 }
                             }
                         }
+                        "user" -> {
+                            // Tool result — show what the tool returned
+                            val msg = json.getAsJsonObject("message")
+                            val content = msg?.getAsJsonArray("content")
+                            if (content != null) {
+                                for (item in content) {
+                                    val obj = item.asJsonObject
+                                    if (obj.get("type")?.asString == "tool_result") {
+                                        val toolId = obj.get("tool_use_id")?.asString ?: ""
+                                        // Brief indication that tool completed
+                                        onActivity?.invoke("\u2713 Done")
+                                    }
+                                }
+                            }
+                        }
                         "content_block_delta" -> {
                             val delta = json.getAsJsonObject("delta")
                             val text = delta?.get("text")?.asString
@@ -237,7 +257,7 @@ When reviewing hunks, explain what changed and whether it's safe to accept."""
         val claude = findClaudePath()
             ?: return ChatResponse(null, "Claude Code not found", true)
 
-        val cmd = mutableListOf(claude, "-p", "--output-format", "json")
+        val cmd = mutableListOf(claude, "-p", "--output-format", "json", "--effort", "high")
         if (shouldContinue) {
             cmd.add("--continue")
         } else if (systemPrompt != null) {
