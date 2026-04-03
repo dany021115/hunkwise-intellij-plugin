@@ -7,137 +7,294 @@ import com.intellij.openapi.project.Project
 import java.io.BufferedReader
 import java.io.InputStreamReader
 
-/**
- * Integrates with Claude Code CLI (`claude -p`) for AI chat.
- * Runs `claude` as a subprocess with stdin closed to avoid the stdin warning.
- */
 @Service(Service.Level.PROJECT)
 class ClaudeCodeService(private val project: Project) {
 
     private val log = HunkwiseLogger.LOG
-    private var sessionId: String? = null
     private var claudePath: String? = null
+    private var shouldContinue = false
+    @Volatile private var currentProcess: Process? = null
 
     fun findClaudePath(): String? {
         if (claudePath != null) return claudePath
-
         val candidates = listOf(
             "${System.getProperty("user.home")}/.local/bin/claude",
             "/usr/local/bin/claude",
             "/opt/homebrew/bin/claude"
         )
-
         for (path in candidates) {
             if (java.io.File(path).exists() && java.io.File(path).canExecute()) {
-                claudePath = path
-                return path
+                claudePath = path; return path
             }
         }
-
         try {
-            val process = ProcessBuilder("which", "claude")
-                .redirectErrorStream(true).start()
-            val result = process.inputStream.bufferedReader().readText().trim()
-            if (process.waitFor() == 0 && result.isNotEmpty()) {
-                claudePath = result
-                return result
-            }
+            val p = ProcessBuilder("which", "claude").redirectErrorStream(true).start()
+            val r = p.inputStream.bufferedReader().readText().trim()
+            if (p.waitFor() == 0 && r.isNotEmpty()) { claudePath = r; return r }
         } catch (_: Exception) {}
-
         return null
     }
 
     fun isAvailable(): Boolean = findClaudePath() != null
 
     /**
-     * Send a message to Claude Code and get the response.
-     * Runs synchronously — call from a background thread.
+     * Build a system prompt with project context.
      */
-    fun sendMessage(message: String, workingDir: String? = null): ChatResponse {
-        val claude = findClaudePath()
-            ?: return ChatResponse(null, "Claude Code not found. Install from https://claude.ai/code", true)
+    fun buildSystemPrompt(): String {
+        val root = project.basePath ?: return ""
+        val branch = try {
+            val p = ProcessBuilder("git", "rev-parse", "--abbrev-ref", "HEAD")
+                .directory(java.io.File(root)).redirectErrorStream(true).start()
+            p.inputStream.bufferedReader().readText().trim()
+        } catch (_: Exception) { "unknown" }
+
+        val langs = java.io.File(root).listFiles()?.mapNotNull {
+            when (it.extension) {
+                "kt", "kts" -> "Kotlin"
+                "java" -> "Java"
+                "go" -> "Go"
+                "py" -> "Python"
+                "ts", "tsx" -> "TypeScript"
+                "js", "jsx" -> "JavaScript"
+                "rs" -> "Rust"
+                "swift" -> "Swift"
+                "dart" -> "Dart"
+                else -> null
+            }
+        }?.distinct()?.joinToString(", ") ?: ""
+
+        return """You are reviewing code changes in an IntelliJ IDEA project.
+Project: ${java.io.File(root).name}
+Branch: $branch
+Languages: $langs
+Root: $root
+You can see uncommitted git changes. Help the user understand, review, and decide on changes.
+When reviewing hunks, explain what changed and whether it's safe to accept."""
+    }
+
+    /**
+     * Send message with streaming support.
+     * onToken: text chunks as they arrive
+     * onActivity: status updates like "Reading file...", "Searching...", "Thinking..."
+     */
+    fun sendMessageStreaming(
+        message: String,
+        systemPrompt: String? = null,
+        onToken: (String) -> Unit,
+        onActivity: ((String) -> Unit)? = null,
+        onDone: (ChatResponse) -> Unit
+    ) {
+        val claude = findClaudePath() ?: run {
+            onDone(ChatResponse(null, "Claude Code not found", true))
+            return
+        }
+
+        val cmd = mutableListOf(claude, "-p", "--output-format", "stream-json", "--verbose")
+        if (shouldContinue) {
+            // Continue existing session — do NOT pass system prompt (it forces new session)
+            cmd.add("--continue")
+        } else if (systemPrompt != null) {
+            // First message only — set system prompt
+            cmd.add("--system-prompt")
+            cmd.add(systemPrompt)
+        }
+
+        cmd.add(message)
+
+        val pb = ProcessBuilder(cmd)
+        pb.redirectInput(ProcessBuilder.Redirect.from(java.io.File("/dev/null")))
+        project.basePath?.let { pb.directory(java.io.File(it)) }
 
         try {
-            val cmd = mutableListOf(claude, "-p", "--output-format", "json")
-
-            sessionId?.let {
-                cmd.add("--session-id")
-                cmd.add(it)
-            }
-
-            cmd.add(message)
-
-            val pb = ProcessBuilder(cmd)
-            // Do NOT redirectErrorStream — keep stderr separate so warnings don't corrupt JSON
-            pb.redirectInput(ProcessBuilder.Redirect.from(java.io.File("/dev/null"))) // avoid stdin warning
-
-            if (workingDir != null) {
-                pb.directory(java.io.File(workingDir))
-            } else {
-                project.basePath?.let { pb.directory(java.io.File(it)) }
-            }
-
             val process = pb.start()
+            currentProcess = process
 
-            // Read stdout (JSON response)
-            val stdout = StringBuilder()
-            val stdoutReader = BufferedReader(InputStreamReader(process.inputStream))
+            val reader = BufferedReader(InputStreamReader(process.inputStream))
+            val fullResponse = StringBuilder()
+            var hasStartedText = false
+
             var line: String?
-            while (stdoutReader.readLine().also { line = it } != null) {
-                stdout.appendLine(line)
-            }
+            while (reader.readLine().also { line = it } != null) {
+                if (currentProcess == null) break
 
-            // Read stderr (warnings, can ignore)
-            val stderr = StringBuilder()
-            val stderrReader = BufferedReader(InputStreamReader(process.errorStream))
-            while (stderrReader.readLine().also { line = it } != null) {
-                stderr.appendLine(line)
+                val l = line ?: continue
+                if (!l.startsWith("{")) continue
+
+                try {
+                    val json = JsonParser.parseString(l).asJsonObject
+                    val type = json.get("type")?.asString ?: continue
+
+                    when (type) {
+                        "system" -> {
+                            val subtype = json.get("subtype")?.asString
+                            when (subtype) {
+                                "init" -> onActivity?.invoke("\u25CF Initializing...")
+                            }
+                        }
+                        "assistant" -> {
+                            // Parse content array for text and tool_use
+                            val msg = json.getAsJsonObject("message")
+                            val content = msg?.getAsJsonArray("content")
+                            if (content != null) {
+                                for (item in content) {
+                                    val obj = item.asJsonObject
+                                    val itemType = obj.get("type")?.asString
+                                    when (itemType) {
+                                        "text" -> {
+                                            val text = obj.get("text")?.asString ?: ""
+                                            if (text.isNotEmpty()) {
+                                                if (!hasStartedText) {
+                                                    onActivity?.invoke("") // clear activity
+                                                    hasStartedText = true
+                                                }
+                                                fullResponse.append(text)
+                                                onToken(text)
+                                            }
+                                        }
+                                        "tool_use" -> {
+                                            val toolName = obj.get("name")?.asString ?: "tool"
+                                            val input = obj.getAsJsonObject("input")
+                                            val detail = when (toolName) {
+                                                "Read" -> {
+                                                    val fp = input?.get("file_path")?.asString ?: ""
+                                                    val short = fp.substringAfterLast("/")
+                                                    "\u25CF Reading $short"
+                                                }
+                                                "Grep" -> {
+                                                    val pat = input?.get("pattern")?.asString ?: ""
+                                                    "\u25CF Searching: $pat"
+                                                }
+                                                "Glob" -> {
+                                                    val pat = input?.get("pattern")?.asString ?: ""
+                                                    "\u25CF Finding: $pat"
+                                                }
+                                                "Edit" -> {
+                                                    val fp = input?.get("file_path")?.asString ?: ""
+                                                    "\u25CF Editing ${fp.substringAfterLast("/")}"
+                                                }
+                                                "Write" -> {
+                                                    val fp = input?.get("file_path")?.asString ?: ""
+                                                    "\u25CF Writing ${fp.substringAfterLast("/")}"
+                                                }
+                                                "Bash" -> {
+                                                    val cmd2 = input?.get("command")?.asString ?: ""
+                                                    val short = if (cmd2.length > 40) cmd2.take(40) + "..." else cmd2
+                                                    "\u25CF Running: $short"
+                                                }
+                                                else -> "\u25CF Using $toolName"
+                                            }
+                                            onActivity?.invoke(detail)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        "content_block_delta" -> {
+                            val delta = json.getAsJsonObject("delta")
+                            val text = delta?.get("text")?.asString
+                            if (text != null) {
+                                if (!hasStartedText) {
+                                    onActivity?.invoke("")
+                                    hasStartedText = true
+                                }
+                                fullResponse.append(text)
+                                onToken(text)
+                            }
+                        }
+                        "result" -> {
+                            val result = json.get("result")?.asString
+                            if (json.get("session_id")?.asString != null) shouldContinue = true
+                            if (result != null && fullResponse.isEmpty()) {
+                                fullResponse.append(result)
+                                onToken(result)
+                            }
+                        }
+                    }
+                } catch (_: Exception) {}
             }
 
             val exitCode = process.waitFor()
-            val rawStdout = stdout.toString().trim()
+            currentProcess = null
 
-            if (exitCode != 0 && rawStdout.isEmpty()) {
-                val errMsg = stderr.toString().trim()
-                return ChatResponse(null, "Claude Code error (exit $exitCode):\n$errMsg", true)
+            if (fullResponse.isEmpty()) {
+                val stderr = try { process.errorStream.bufferedReader().readText() } catch (_: Exception) { "" }
+                onDone(ChatResponse(null, "No response. $stderr", exitCode != 0))
+            } else {
+                onDone(ChatResponse(fullResponse.toString(), null, false))
             }
 
-            // Parse JSON — find the JSON object in stdout (skip any non-JSON lines)
-            val jsonStart = rawStdout.indexOf('{')
-            if (jsonStart < 0) {
-                return ChatResponse(rawStdout.ifEmpty { null }, "No JSON response", rawStdout.isEmpty())
+        } catch (e: Exception) {
+            currentProcess = null
+            log.warn("Claude streaming error: $e")
+            onDone(ChatResponse(null, "Error: ${e.message}", true))
+        }
+    }
+
+    /**
+     * Non-streaming fallback (simpler, more reliable).
+     */
+    fun sendMessage(message: String, systemPrompt: String? = null): ChatResponse {
+        val claude = findClaudePath()
+            ?: return ChatResponse(null, "Claude Code not found", true)
+
+        val cmd = mutableListOf(claude, "-p", "--output-format", "json")
+        if (shouldContinue) {
+            cmd.add("--continue")
+        } else if (systemPrompt != null) {
+            cmd.add("--system-prompt")
+            cmd.add(systemPrompt)
+        }
+
+        cmd.add(message)
+
+        val pb = ProcessBuilder(cmd)
+        pb.redirectInput(ProcessBuilder.Redirect.from(java.io.File("/dev/null")))
+        project.basePath?.let { pb.directory(java.io.File(it)) }
+
+        try {
+            val process = pb.start()
+            currentProcess = process
+
+            val stdout = process.inputStream.bufferedReader().readText().trim()
+            val exitCode = process.waitFor()
+            currentProcess = null
+
+            if (exitCode != 0 && stdout.isEmpty()) {
+                val err = process.errorStream.bufferedReader().readText().trim()
+                return ChatResponse(null, "Exit $exitCode: $err", true)
             }
 
-            val jsonStr = rawStdout.substring(jsonStart)
+            val jsonStart = stdout.indexOf('{')
+            if (jsonStart < 0) return ChatResponse(stdout.ifEmpty { null }, null, false)
+            val jsonStr = stdout.substring(jsonStart)
 
             return try {
                 val json = JsonParser.parseString(jsonStr).asJsonObject
                 val result = json.get("result")?.asString
-                val newSessionId = json.get("session_id")?.asString
                 val isError = json.get("is_error")?.asBoolean ?: false
-
-                if (newSessionId != null) {
-                    sessionId = newSessionId
-                }
-
-                if (isError) {
-                    ChatResponse(null, result ?: "Unknown error", true)
-                } else {
-                    ChatResponse(result ?: "", null, false)
-                }
-            } catch (e: Exception) {
-                log.warn("JSON parse error: $e, raw: $jsonStr")
-                ChatResponse(rawStdout, null, false)
+                if (json.get("session_id")?.asString != null) shouldContinue = true
+                if (isError) ChatResponse(null, result ?: "Error", true)
+                else ChatResponse(result ?: "", null, false)
+            } catch (_: Exception) {
+                ChatResponse(stdout, null, false)
             }
 
         } catch (e: Exception) {
-            log.warn("Claude Code error: $e")
+            currentProcess = null
             return ChatResponse(null, "Error: ${e.message}", true)
         }
     }
 
+    fun cancel() {
+        currentProcess?.let {
+            try { it.destroyForcibly() } catch (_: Exception) {}
+            currentProcess = null
+        }
+    }
+
     fun resetSession() {
-        sessionId = null
+        shouldContinue = false
+        cancel()
     }
 
     data class ChatResponse(

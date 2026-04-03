@@ -10,8 +10,6 @@
     <depends>com.intellij.modules.platform</depends>
 
     <extensions defaultExtensionNs="com.intellij">
-        <postStartupActivity implementation="com.hunkwise.HunkwisePlugin"/>
-        <postStartupActivity implementation="com.hunkwise.editor.HunkEditorListener"/>
         <toolWindow id="Hunkwise"
                     anchor="right"
                     secondary="false"

@@ -253,9 +253,20 @@ class StateManager(private val project: Project) {
                 // permission errors etc — treat as idle
             }
 
-            if (fileDeleted || (diskContent != null && diskContent != baseline)) {
+            if (fileDeleted) {
+                // File was deleted externally — show for review
                 state[filePath] = FileState(FileStatus.REVIEWING, baseline)
                 reviewing.add(filePath)
+            } else if (diskContent != null && diskContent != baseline) {
+                // Baseline is stale — silently update to current disk content
+                // so only NEW changes from this point forward are tracked
+                enqueueGit {
+                    try {
+                        g.snapshot(filePath, diskContent)
+                    } catch (e: Exception) {
+                        log.warn("load: failed to update baseline for $filePath: $e")
+                    }
+                }
             }
         }
 
