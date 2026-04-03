@@ -110,6 +110,13 @@ class ProjectGitService(private val project: Project) {
         return FileDiff(filePath, status, hunks)
     }
 
+    /** Get HEAD version content for a file */
+    fun getHeadContent(filePath: String): String? {
+        val root = project.basePath ?: return null
+        val relPath = File(filePath).toRelativeString(File(root))
+        return git("show", "HEAD:$relPath")
+    }
+
     // ══════════════════════════════════════════════════════════════════
     // ACCEPT / DISCARD operations
     // ══════════════════════════════════════════════════════════════════

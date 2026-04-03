@@ -8,8 +8,8 @@ import com.intellij.ui.content.ContentFactory
 class HunkwiseToolWindowFactory : ToolWindowFactory {
 
     override fun createToolWindowContent(project: Project, toolWindow: ToolWindow) {
-        val panel = ReviewPanel(project)
-        val content = ContentFactory.getInstance().createContent(panel, "Review", false)
+        val panel = ReviewPanel(project, toolWindow.disposable)
+        val content = ContentFactory.getInstance().createContent(panel, "Claude Code", false)
         toolWindow.contentManager.addContent(content)
     }
 }

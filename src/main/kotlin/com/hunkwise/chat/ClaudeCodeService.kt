@@ -14,6 +14,7 @@ class ClaudeCodeService(private val project: Project) {
     private var claudePath: String? = null
     private var shouldContinue = false
     @Volatile private var currentProcess: Process? = null
+    @Volatile var autoAcceptCommands = false
 
     fun findClaudePath(): String? {
         if (claudePath != null) return claudePath
@@ -82,11 +83,19 @@ RULES:
      * onToken: text chunks as they arrive
      * onActivity: status updates like "Reading file...", "Searching...", "Thinking..."
      */
+    data class ToolEvent(
+        val toolName: String,
+        val filePath: String?,
+        val command: String?,
+        val description: String?
+    )
+
     fun sendMessageStreaming(
         message: String,
         systemPrompt: String? = null,
         onToken: (String) -> Unit,
         onActivity: ((String) -> Unit)? = null,
+        onToolUse: ((ToolEvent) -> Unit)? = null,
         onDone: (ChatResponse) -> Unit
     ) {
         val claude = findClaudePath() ?: run {
@@ -95,8 +104,16 @@ RULES:
         }
 
         val cmd = mutableListOf(claude, "-p", "--output-format", "stream-json", "--verbose", "--effort", "high")
+
+        // Permission mode: auto-accept or accept edits only
+        if (autoAcceptCommands) {
+            cmd.add("--dangerously-skip-permissions")
+        } else {
+            cmd.add("--permission-mode")
+            cmd.add("acceptEdits")
+        }
+
         if (shouldContinue) {
-            // Continue existing session — do NOT pass system prompt (it forces new session)
             cmd.add("--continue")
         } else if (systemPrompt != null) {
             // First message only — set system prompt
@@ -159,36 +176,33 @@ RULES:
                                         "tool_use" -> {
                                             val toolName = obj.get("name")?.asString ?: "tool"
                                             val input = obj.getAsJsonObject("input")
+                                            val fp = input?.get("file_path")?.asString
+                                            val cmd2 = input?.get("command")?.asString
+                                            val desc = input?.get("description")?.asString
+
                                             val detail = when (toolName) {
-                                                "Read" -> {
-                                                    val fp = input?.get("file_path")?.asString ?: ""
-                                                    val short = fp.substringAfterLast("/")
-                                                    "\u25CF Reading $short"
-                                                }
-                                                "Grep" -> {
-                                                    val pat = input?.get("pattern")?.asString ?: ""
-                                                    "\u25CF Searching: $pat"
-                                                }
-                                                "Glob" -> {
-                                                    val pat = input?.get("pattern")?.asString ?: ""
-                                                    "\u25CF Finding: $pat"
-                                                }
-                                                "Edit" -> {
-                                                    val fp = input?.get("file_path")?.asString ?: ""
-                                                    "\u25CF Editing ${fp.substringAfterLast("/")}"
-                                                }
-                                                "Write" -> {
-                                                    val fp = input?.get("file_path")?.asString ?: ""
-                                                    "\u25CF Writing ${fp.substringAfterLast("/")}"
-                                                }
+                                                "Read" -> "\u25CF Reading ${fp?.substringAfterLast("/") ?: ""}"
+                                                "Grep" -> "\u25CF Searching: ${input?.get("pattern")?.asString ?: ""}"
+                                                "Glob" -> "\u25CF Finding: ${input?.get("pattern")?.asString ?: ""}"
+                                                "Edit" -> "\u25CF Editing ${fp?.substringAfterLast("/") ?: ""}"
+                                                "Write" -> "\u25CF Writing ${fp?.substringAfterLast("/") ?: ""}"
                                                 "Bash" -> {
-                                                    val cmd2 = input?.get("command")?.asString ?: ""
-                                                    val short = if (cmd2.length > 40) cmd2.take(40) + "..." else cmd2
+                                                    val short = if ((cmd2?.length ?: 0) > 50) cmd2?.take(50) + "..." else cmd2 ?: ""
                                                     "\u25CF Running: $short"
                                                 }
                                                 else -> "\u25CF Using $toolName"
                                             }
                                             onActivity?.invoke(detail)
+
+                                            // Emit tool event for diff/permission blocks
+                                            if (toolName in listOf("Edit", "Write", "Bash")) {
+                                                onToolUse?.invoke(ToolEvent(
+                                                    toolName = toolName,
+                                                    filePath = fp,
+                                                    command = cmd2,
+                                                    description = desc
+                                                ))
+                                            }
                                         }
                                     }
                                 }
@@ -258,6 +272,14 @@ RULES:
             ?: return ChatResponse(null, "Claude Code not found", true)
 
         val cmd = mutableListOf(claude, "-p", "--output-format", "json", "--effort", "high")
+
+        if (autoAcceptCommands) {
+            cmd.add("--dangerously-skip-permissions")
+        } else {
+            cmd.add("--permission-mode")
+            cmd.add("acceptEdits")
+        }
+
         if (shouldContinue) {
             cmd.add("--continue")
         } else if (systemPrompt != null) {
