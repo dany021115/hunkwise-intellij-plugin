@@ -1,6 +1,5 @@
 package com.hunkwise.editor
 
-import com.intellij.openapi.components.service
 import com.intellij.openapi.editor.event.EditorMouseEvent
 import com.intellij.openapi.editor.event.EditorMouseListener
 import com.intellij.openapi.fileEditor.FileEditorManager
@@ -11,64 +10,56 @@ import com.intellij.openapi.startup.ProjectActivity
 import com.intellij.openapi.vfs.VirtualFile
 
 /**
- * Listens for mouse clicks on inline diff Accept/Discard buttons.
- * Registers on all editors that open.
+ * Registers click listener on all editors to handle Accept/Discard button clicks
+ * on inline diff block inlays.
  */
 class InlineDiffClickListener : ProjectActivity {
 
     override suspend fun execute(project: Project) {
-        val clickListener = object : EditorMouseListener {
+        val listener = object : EditorMouseListener {
             override fun mouseClicked(event: EditorMouseEvent) {
                 val editor = event.editor
                 val point = event.mouseEvent.point
 
-                // Check all block inlays for AcceptDiscardRenderer
                 val inlays = editor.inlayModel.getBlockElementsInRange(0, editor.document.textLength)
                 for (inlay in inlays) {
                     val renderer = inlay.renderer
-                    // Use reflection-free check
-                    if (renderer.javaClass.name.contains("AcceptDiscardRenderer")) {
+                    if (renderer is InlineDiffService.AcceptDiscardBlock) {
                         val bounds = inlay.bounds ?: continue
-
-                        // Check if click is within inlay bounds
                         if (point.y >= bounds.y && point.y <= bounds.y + bounds.height) {
-                            try {
-                                val acceptMethod = renderer.javaClass.getMethod("getAcceptBounds")
-                                val discardMethod = renderer.javaClass.getMethod("getDiscardBounds")
-                                val acceptBounds = acceptMethod.invoke(renderer) as java.awt.Rectangle
-                                val discardBounds = discardMethod.invoke(renderer) as java.awt.Rectangle
-
-                                if (acceptBounds.contains(point)) {
-                                    val accept = renderer.javaClass.getMethod("accept")
-                                    accept.invoke(renderer)
-                                    event.consume()
-                                    return
-                                }
-                                if (discardBounds.contains(point)) {
-                                    val discard = renderer.javaClass.getMethod("discard")
-                                    discard.invoke(renderer)
-                                    event.consume()
-                                    return
-                                }
-                            } catch (_: Exception) {}
+                            if (renderer.acceptBounds.contains(point)) {
+                                renderer.onAccept()
+                                event.consume()
+                                return
+                            }
+                            if (renderer.discardBounds.contains(point)) {
+                                renderer.onDiscard()
+                                event.consume()
+                                return
+                            }
                         }
                     }
                 }
             }
         }
 
-        // Register on all editors
+        // Register on new editors
         project.messageBus.connect().subscribe(
             FileEditorManagerListener.FILE_EDITOR_MANAGER,
             object : FileEditorManagerListener {
                 override fun fileOpened(source: FileEditorManager, file: VirtualFile) {
                     for (fe in source.getEditors(file)) {
-                        if (fe is TextEditor) {
-                            fe.editor.addEditorMouseListener(clickListener)
-                        }
+                        if (fe is TextEditor) fe.editor.addEditorMouseListener(listener)
                     }
                 }
             }
         )
+
+        // Register on already-open editors
+        for (file in FileEditorManager.getInstance(project).openFiles) {
+            for (fe in FileEditorManager.getInstance(project).getEditors(file)) {
+                if (fe is TextEditor) fe.editor.addEditorMouseListener(listener)
+            }
+        }
     }
 }

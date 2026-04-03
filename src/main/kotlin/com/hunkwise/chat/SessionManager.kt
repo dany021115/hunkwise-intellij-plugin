@@ -22,8 +22,11 @@ class SessionManager(private val project: Project) {
     private val sessions = mutableListOf<SessionInfo>()
 
     data class ChatMessage(
-        val sender: String,       // "You", "Claude", "system", "error"
+        val sender: String,       // "You", "Claude", "system", "error", "diff", "activity"
         val text: String,
+        val filePath: String? = null,   // for diff messages
+        val addedCount: Int = 0,        // for diff messages
+        val removedCount: Int = 0,      // for diff messages
         val timestamp: Long = System.currentTimeMillis()
     )
 
@@ -72,6 +75,20 @@ class SessionManager(private val project: Project) {
         saveSession(session)
         refreshSessionList()
         return session
+    }
+
+    /** Add a diff block to the session */
+    fun addDiffMessage(filePath: String, addedCount: Int, removedCount: Int) {
+        val session = getCurrentSession()
+        session.messages.add(ChatMessage("diff", "", filePath, addedCount, removedCount))
+        saveSession(session.copy(updatedAt = System.currentTimeMillis()))
+    }
+
+    /** Add an activity message */
+    fun addActivityMessage(text: String) {
+        val session = getCurrentSession()
+        session.messages.add(ChatMessage("activity", text))
+        saveSession(session.copy(updatedAt = System.currentTimeMillis()))
     }
 
     /** Add a message to the current session and save */

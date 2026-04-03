@@ -2,15 +2,13 @@ package com.hunkwise.toolwindow
 
 import com.hunkwise.HunkwiseColors
 import com.hunkwise.chat.*
+import com.hunkwise.editor.InlineDiffService
 import com.hunkwise.git.ProjectGitService
 import com.hunkwise.git.ProjectGitService.*
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.components.service
-import com.intellij.openapi.fileEditor.FileEditorManager
-import com.intellij.openapi.fileEditor.TextEditor
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
-import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VirtualFileManager
 import com.intellij.openapi.vfs.newvfs.BulkFileListener
 import com.intellij.openapi.vfs.newvfs.events.VFileContentChangeEvent
@@ -24,9 +22,11 @@ import javax.swing.text.StyleConstants
 
 /**
  * Full chat panel — Claude runs in background.
- * Shows text responses + persistent inline diff blocks (Cursor-style).
- * All activity (read, search, edit, run) stays visible as a log.
- * Click a diff block → opens IntelliJ diff viewer with per-line accept/reject.
+ * - Streaming text responses
+ * - Persistent activity log (Reading, Editing, etc.)
+ * - Inline diff blocks (collapsible, click opens file with Accept/Discard)
+ * - Permission denials shown with Allow/Allow always/Deny
+ * - All content persists (nothing gets deleted)
  */
 class ReviewPanel(
     private val project: Project,
@@ -42,7 +42,6 @@ class ReviewPanel(
         font = Font("SansSerif", Font.PLAIN, 12)
         border = EmptyBorder(12, 16, 12, 16)
     }
-
     private val chatInput = JTextField().apply {
         background = HunkwiseColors.SURFACE_ALT; foreground = HunkwiseColors.MUTED
         caretColor = HunkwiseColors.FG; font = Font("SansSerif", Font.PLAIN, 13)
@@ -51,10 +50,12 @@ class ReviewPanel(
     }
 
     private var isSending = false
-    private var streamingStartOffset = -1
     private val streamingBuffer = StringBuilder()
     private val trackedFiles = mutableSetOf<String>()
     private var lastActivity = ""
+    private var lastSentMessage = ""
+    private var actionButton: JLabel? = null
+    private var pendingImagePath: String? = null
 
     init {
         background = HunkwiseColors.BG
@@ -79,15 +80,12 @@ class ReviewPanel(
     }
 
     private fun buildLayout() {
-        // Header
-        val header = JPanel(BorderLayout())
-        header.background = HunkwiseColors.BG
-        header.border = EmptyBorder(8, 14, 8, 14)
-        header.preferredSize = Dimension(0, 38)
-
+        val header = JPanel(BorderLayout()).apply {
+            background = HunkwiseColors.BG; border = EmptyBorder(8, 14, 8, 14)
+            preferredSize = Dimension(0, 38)
+        }
         val hLeft = JPanel(FlowLayout(FlowLayout.LEFT, 8, 0)).apply { isOpaque = false }
         hLeft.add(lbl("Hunkwise", HunkwiseColors.FG, 13, true))
-
         val hRight = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0)).apply { isOpaque = false }
         hRight.add(lbl("+", HunkwiseColors.MUTED, 16, false).apply {
             cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR); toolTipText = "New conversation"
@@ -97,27 +95,18 @@ class ReviewPanel(
             cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR); toolTipText = "History"
             addMouseListener(click { showHistory(this) })
         })
-        hRight.add(lbl("\u25A0", HunkwiseColors.RED, 12, true).apply {
-            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR); toolTipText = "Cancel"
-            addMouseListener(click { claudeService.cancel(); isSending = false })
-        })
-        header.add(hLeft, BorderLayout.WEST)
-        header.add(hRight, BorderLayout.EAST)
+        header.add(hLeft, BorderLayout.WEST); header.add(hRight, BorderLayout.EAST)
 
-        // Chat scroll
         val chatScroll = JBScrollPane(chatPane).apply {
             border = null; background = HunkwiseColors.BG; viewport.background = HunkwiseColors.BG
             horizontalScrollBarPolicy = ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER
         }
 
-        // Input bar
         val bottomPanel = JPanel(BorderLayout()).apply { background = HunkwiseColors.BG }
         val inputBar = JPanel(BorderLayout()).apply {
             background = HunkwiseColors.SURFACE
             border = BorderFactory.createCompoundBorder(
-                BorderFactory.createMatteBorder(1, 0, 0, 0, HunkwiseColors.BORDER),
-                EmptyBorder(6, 8, 6, 8)
-            )
+                BorderFactory.createMatteBorder(1, 0, 0, 0, HunkwiseColors.BORDER), EmptyBorder(6, 8, 6, 8))
         }
         val inputWrapper = JPanel(BorderLayout()).apply {
             background = HunkwiseColors.SURFACE_ALT
@@ -133,46 +122,84 @@ class ReviewPanel(
             }
             override fun paintComponent(g: Graphics) {
                 (g as Graphics2D).setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
-                g.color = HunkwiseColors.ORANGE; g.fillRoundRect(2, 5, width - 4, height - 10, 8, 8)
+                g.color = if (isSending) HunkwiseColors.RED else HunkwiseColors.ORANGE
+                g.fillRoundRect(2, 5, width - 4, height - 10, 8, 8)
                 super.paintComponent(g)
             }
         }
-        sendBtn.addMouseListener(click { sendChat() })
-        inputBar.add(inputWrapper, BorderLayout.CENTER)
-        inputBar.add(sendBtn, BorderLayout.EAST)
+        actionButton = sendBtn
+        sendBtn.addMouseListener(click {
+            if (isSending) { claudeService.cancel(); isSending = false; updateBtn() }
+            else sendChat()
+        })
+        // Image attach button
+        val imgBtn = lbl("\uD83D\uDDBC", HunkwiseColors.MUTED, 16, false).apply {
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+            toolTipText = "Attach image"
+            border = EmptyBorder(0, 6, 0, 4)
+        }
+        imgBtn.addMouseListener(click { attachImage() })
+
+        val rightBtns = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply { isOpaque = false }
+        rightBtns.add(imgBtn); rightBtns.add(sendBtn)
+
+        inputBar.add(inputWrapper, BorderLayout.CENTER); inputBar.add(rightBtns, BorderLayout.EAST)
 
         val toolbar = JPanel(BorderLayout()).apply {
             background = HunkwiseColors.BG; border = EmptyBorder(4, 14, 6, 14)
         }
-        val tbLeft = JPanel(FlowLayout(FlowLayout.LEFT, 8, 0)).apply { isOpaque = false }
-        tbLeft.add(lbl("\u221E Agent \u25BE", HunkwiseColors.MUTED, 11, false))
-        tbLeft.add(lbl("Auto \u25BE", HunkwiseColors.MUTED, 11, false))
-
-        val tbRight = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0)).apply { isOpaque = false }
-        val bypassLbl = lbl("\uD83D\uDD12 Bypass OFF", HunkwiseColors.MUTED, 11, false)
-        bypassLbl.cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-        bypassLbl.toolTipText = "Toggle auto-accept all commands"
+        val tbL = JPanel(FlowLayout(FlowLayout.LEFT, 8, 0)).apply { isOpaque = false }
+        tbL.add(lbl("\u221E Agent \u25BE", HunkwiseColors.MUTED, 11, false))
+        tbL.add(lbl("Auto \u25BE", HunkwiseColors.MUTED, 11, false))
+        val tbR = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0)).apply { isOpaque = false }
+        val bypassLbl = lbl("\uD83D\uDD12 Bypass OFF", HunkwiseColors.MUTED, 11, false).apply {
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        }
         bypassLbl.addMouseListener(click {
             claudeService.autoAcceptCommands = !claudeService.autoAcceptCommands
-            if (claudeService.autoAcceptCommands) {
-                bypassLbl.text = "\uD83D\uDD13 Bypass ON"
-                bypassLbl.foreground = HunkwiseColors.GREEN
-            } else {
-                bypassLbl.text = "\uD83D\uDD12 Bypass OFF"
-                bypassLbl.foreground = HunkwiseColors.MUTED
-            }
+            bypassLbl.text = if (claudeService.autoAcceptCommands) "\uD83D\uDD13 Bypass ON" else "\uD83D\uDD12 Bypass OFF"
+            bypassLbl.foreground = if (claudeService.autoAcceptCommands) HunkwiseColors.GREEN else HunkwiseColors.MUTED
         })
-        tbRight.add(bypassLbl)
+        tbR.add(bypassLbl)
+        toolbar.add(tbL, BorderLayout.WEST); toolbar.add(tbR, BorderLayout.EAST)
 
-        toolbar.add(tbLeft, BorderLayout.WEST)
-        toolbar.add(tbRight, BorderLayout.EAST)
+        bottomPanel.add(inputBar, BorderLayout.CENTER); bottomPanel.add(toolbar, BorderLayout.SOUTH)
+        add(header, BorderLayout.NORTH); add(chatScroll, BorderLayout.CENTER); add(bottomPanel, BorderLayout.SOUTH)
+    }
 
-        bottomPanel.add(inputBar, BorderLayout.CENTER)
-        bottomPanel.add(toolbar, BorderLayout.SOUTH)
+    private fun updateBtn() { actionButton?.text = if (isSending) "\u25A0" else "\u2191"; actionButton?.repaint() }
 
-        add(header, BorderLayout.NORTH)
-        add(chatScroll, BorderLayout.CENTER)
-        add(bottomPanel, BorderLayout.SOUTH)
+    private fun attachImage() {
+        val chooser = JFileChooser().apply {
+            dialogTitle = "Select Image"
+            fileFilter = javax.swing.filechooser.FileNameExtensionFilter(
+                "Images", "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"
+            )
+            currentDirectory = java.io.File(System.getProperty("user.home"), "Desktop")
+        }
+        if (chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
+            val file = chooser.selectedFile
+            pendingImagePath = file.absolutePath
+
+            // Show attached image indicator in input
+            if (chatInput.text == "Reject, suggest, follow up?" || chatInput.text.isEmpty()) {
+                chatInput.text = ""
+                chatInput.foreground = HunkwiseColors.FG
+            }
+
+            // Show thumbnail indicator in chat
+            val doc = chatPane.styledDocument
+            if (doc.length > 0) doc.insertString(doc.length, "\n", null)
+            val s = chatPane.addStyle("img${doc.length}", null)
+            StyleConstants.setForeground(s, HunkwiseColors.BLUE)
+            StyleConstants.setFontSize(s, 11); StyleConstants.setFontFamily(s, "JetBrains Mono")
+            StyleConstants.setItalic(s, true)
+            doc.insertString(doc.length, "\uD83D\uDDBC Attached: ${file.name}", s)
+            chatPane.caretPosition = doc.length
+
+            // Focus input for message
+            chatInput.requestFocusInWindow()
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -180,198 +207,68 @@ class ReviewPanel(
     // ══════════════════════════════════════════════════════════════════
 
     private fun sendChat() {
-        val msg = chatInput.text.trim()
-        if (msg.isEmpty() || msg == "Reject, suggest, follow up?" || isSending) return
-        chatInput.text = ""; chatInput.foreground = HunkwiseColors.FG
-        appendMsg("You", msg, HunkwiseColors.SENDER_USER)
-
-        if (!claudeService.isAvailable()) {
-            appendMsg("system", "Claude Code not found.\nnpm install -g @anthropic-ai/claude-code", HunkwiseColors.RED)
-            return
+        var msg = chatInput.text.trim()
+        if (msg.isEmpty() || msg == "Reject, suggest, follow up?") {
+            if (pendingImagePath == null) return
+            msg = "describe this image"
         }
+        chatInput.text = ""; chatInput.foreground = HunkwiseColors.FG
 
-        val contextMsg = buildMessageWithHistory(msg)
-        val systemPrompt = claudeService.buildSystemPrompt()
-        trackedFiles.clear()
-        isSending = true
-        startStreaming()
+        // If image is attached, include path in message
+        val imagePath = pendingImagePath
+        if (imagePath != null) {
+            msg = "$msg\n\nImage file: $imagePath\nPlease read and analyze this image file."
+            appendMsg("You", "${msg.substringBefore("\n")}\n\uD83D\uDDBC ${File(imagePath).name}", HunkwiseColors.SENDER_USER)
+            pendingImagePath = null
+        } else {
+            appendMsg("You", msg, HunkwiseColors.SENDER_USER)
+        }
+        lastSentMessage = msg
+        if (!claudeService.isAvailable()) {
+            appendMsg("system", "Claude Code not found.", HunkwiseColors.RED); return
+        }
+        val ctx = buildContext(msg)
+        val sys = claudeService.buildSystemPrompt()
+        trackedFiles.clear(); isSending = true; updateBtn()
+        streamingBuffer.clear()
+
+        // Show "Claude" header
+        val doc = chatPane.styledDocument
+        if (doc.length > 0) doc.insertString(doc.length, "\n\n", null)
+        val s = chatPane.addStyle("hdr${doc.length}", null)
+        StyleConstants.setBold(s, true); StyleConstants.setForeground(s, HunkwiseColors.SENDER_CLAUDE)
+        StyleConstants.setFontSize(s, 12); StyleConstants.setFontFamily(s, "JetBrains Mono")
+        doc.insertString(doc.length, "Claude\n", s)
+        chatPane.caretPosition = doc.length
 
         Thread {
             claudeService.sendMessageStreaming(
-                message = contextMsg,
-                systemPrompt = systemPrompt,
-                onToken = { token -> SwingUtilities.invokeLater { appendStreamToken(token) } },
-                onActivity = { status -> SwingUtilities.invokeLater { showActivity(status) } },
-                onToolUse = { event -> SwingUtilities.invokeLater { handleToolEvent(event) } },
-                onDone = { response ->
+                message = ctx, systemPrompt = sys,
+                onToken = { t -> SwingUtilities.invokeLater { appendToken(t) } },
+                onActivity = { a -> SwingUtilities.invokeLater { showActivity(a) } },
+                onToolUse = { e -> SwingUtilities.invokeLater { handleTool(e) } },
+                onPermissionDenied = { d -> SwingUtilities.invokeLater { showPermissions(d) } },
+                onDone = { r ->
                     SwingUtilities.invokeLater {
-                        isSending = false
-                        lastActivity = ""
-                        finishStreaming()
-                        if (response.isError) appendMsg("error", response.error ?: "Error", HunkwiseColors.RED)
+                        isSending = false; updateBtn(); lastActivity = ""
+                        val text = streamingBuffer.toString()
+                        if (text.isNotBlank()) sessionManager.addMessage("Claude", text)
+                        if (r.isError) appendMsg("error", r.error ?: "Error", HunkwiseColors.RED)
                     }
                 }
             )
         }.start()
     }
 
-    // ── Tool events ─────────────────────────────────────────────────
-
-    private fun handleToolEvent(event: ClaudeCodeService.ToolEvent) {
-        when (event.toolName) {
-            "Edit", "Write" -> {
-                val filePath = event.filePath ?: return
-                Thread {
-                    val diff = gitService.getFileDiff(filePath)
-                    if (diff != null && diff.hunks.isNotEmpty()) {
-                        SwingUtilities.invokeLater {
-                            trackedFiles.add(filePath)
-                            insertDiffBlock(filePath, diff)
-                        }
-                    }
-                }.start()
-            }
-            "Bash" -> {
-                val cmd = event.command ?: return
-                val desc = event.description ?: cmd.take(40)
-                insertBlock(ChatBlockRenderer.createPermissionBlock(
-                    project, desc, cmd, chatPane.width.coerceAtLeast(300) - 40
-                ))
-            }
-        }
-    }
-
-    /** Insert diff block — click opens IntelliJ diff viewer with accept/reject per line */
-    private fun insertDiffBlock(filePath: String, diff: FileDiff) {
-        val added = diff.hunks.flatMap { it.addedContent }
-        val removed = diff.hunks.flatMap { it.removedContent }
-        val addCount = diff.hunks.sumOf { it.newLines }
-        val remCount = diff.hunks.sumOf { it.oldLines }
-        val w = chatPane.width.coerceAtLeast(300) - 40
-
-        val block = JPanel(BorderLayout())
-        block.background = HunkwiseColors.SURFACE
-        block.border = BorderFactory.createLineBorder(HunkwiseColors.BORDER, 1, true)
-        block.maximumSize = Dimension(w, 350)
-        block.cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-
-        // Header: ✎ filename +N -M
-        val header = JPanel(BorderLayout())
-        header.background = HunkwiseColors.SURFACE_ALT
-        header.border = EmptyBorder(6, 10, 6, 10)
-
-        val hL = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0)).apply { isOpaque = false }
-        hL.add(lbl("\u270E", HunkwiseColors.MUTED, 12, false))
-        hL.add(lbl(File(filePath).name, HunkwiseColors.FG, 12, true))
-        if (addCount > 0) hL.add(lbl("+$addCount", HunkwiseColors.GREEN, 11, false))
-        if (remCount > 0) hL.add(lbl("-$remCount", HunkwiseColors.RED, 11, false))
-        header.add(hL, BorderLayout.WEST)
-        block.add(header, BorderLayout.NORTH)
-
-        // Diff content
-        val content = JPanel().apply {
-            layout = BoxLayout(this, BoxLayout.Y_AXIS); background = HunkwiseColors.SURFACE
-        }
-        for (line in removed.take(8)) {
-            val row = JPanel(BorderLayout()).apply {
-                background = HunkwiseColors.REMOVED_BG; border = EmptyBorder(1, 10, 1, 10)
-                maximumSize = Dimension(w, 18)
-            }
-            row.add(lbl("- $line", HunkwiseColors.RED, 11, false), BorderLayout.WEST)
-            content.add(row)
-        }
-        if (removed.size > 8) content.add(lbl("  ... ${removed.size - 8} more", HunkwiseColors.MUTED, 10, false))
-        for (line in added.take(8)) {
-            val row = JPanel(BorderLayout()).apply {
-                background = HunkwiseColors.ADDED_BG; border = EmptyBorder(1, 10, 1, 10)
-                maximumSize = Dimension(w, 18)
-            }
-            row.add(lbl("+ $line", HunkwiseColors.GREEN, 11, false), BorderLayout.WEST)
-            content.add(row)
-        }
-        if (added.size > 8) content.add(lbl("  ... ${added.size - 8} more", HunkwiseColors.MUTED, 10, false))
-        block.add(content, BorderLayout.CENTER)
-
-        // Click anywhere on block → open IntelliJ diff viewer
-        block.addMouseListener(click { openDiffViewer(filePath) })
-
-        insertBlock(block)
-    }
-
-    // ── Open file with inline diff + Accept/Discard per hunk ──────
-
-    private fun openDiffViewer(filePath: String) {
-        project.service<com.hunkwise.editor.InlineDiffService>().openFileWithDiff(filePath)
-    }
-
-    // ── File change detection ───────────────────────────────────────
-
-    private fun listenForFileChanges() {
-        project.messageBus.connect(this).subscribe(
-            VirtualFileManager.VFS_CHANGES,
-            object : BulkFileListener {
-                override fun after(events: MutableList<out VFileEvent>) {
-                    if (!isSending) return
-                    for (event in events) {
-                        if (event is VFileContentChangeEvent) {
-                            val path = event.file.path
-                            val basePath = project.basePath ?: continue
-                            if (!path.startsWith(basePath) || path.contains("/.git/") || path.contains("/.idea/")) continue
-                            if (trackedFiles.contains(path)) continue
-                            Thread {
-                                val diff = gitService.getFileDiff(path)
-                                if (diff != null && diff.hunks.isNotEmpty()) {
-                                    SwingUtilities.invokeLater {
-                                        trackedFiles.add(path)
-                                        insertDiffBlock(path, diff)
-                                    }
-                                }
-                            }.start()
-                        }
-                    }
-                }
-            }
-        )
-    }
-
-    // ── Streaming ───────────────────────────────────────────────────
-
-    private fun startStreaming() {
-        streamingBuffer.clear()
-        val doc = chatPane.styledDocument
-        if (doc.length > 0) doc.insertString(doc.length, "\n\n", null)
-        val s = chatPane.addStyle("ss${doc.length}", null)
-        StyleConstants.setBold(s, true)
-        StyleConstants.setForeground(s, HunkwiseColors.SENDER_CLAUDE)
-        StyleConstants.setFontSize(s, 12)
-        StyleConstants.setFontFamily(s, "JetBrains Mono")
-        doc.insertString(doc.length, "Claude\n", s)
-        streamingStartOffset = doc.length
-        chatPane.caretPosition = doc.length
-    }
-
-    private fun appendStreamToken(token: String) {
+    private fun appendToken(token: String) {
         streamingBuffer.append(token)
         val doc = chatPane.styledDocument
-        val s = chatPane.addStyle("st${doc.length}", null)
+        val s = chatPane.addStyle("tk${doc.length}", null)
         StyleConstants.setForeground(s, HunkwiseColors.FG)
         StyleConstants.setFontSize(s, 12); StyleConstants.setFontFamily(s, "SansSerif")
         doc.insertString(doc.length, token, s)
         chatPane.caretPosition = doc.length
     }
-
-    private fun finishStreaming() {
-        val fullText = streamingBuffer.toString()
-        if (fullText.isNotBlank()) {
-            // Save to session history
-            sessionManager.addMessage("Claude", fullText)
-            // DON'T remove/replace existing content — keep activity log, diffs, and raw text visible
-            // Just add a formatted summary separator below everything
-        }
-        streamingBuffer.clear(); streamingStartOffset = -1
-    }
-
-    // ── Activity — persistent log ───────────────────────────────────
 
     private fun showActivity(status: String) {
         if (status.isEmpty() || status == lastActivity) return
@@ -385,14 +282,152 @@ class ReviewPanel(
         chatPane.caretPosition = doc.length
     }
 
-    // ── Insert block into chat ──────────────────────────────────────
+    // ── Tool events → diff blocks ───────────────────────────────────
 
-    private fun insertBlock(component: JPanel) {
+    private fun handleTool(event: ClaudeCodeService.ToolEvent) {
+        if (event.toolName in listOf("Edit", "Write")) {
+            val fp = event.filePath ?: return
+            Thread {
+                val diff = gitService.getFileDiff(fp)
+                if (diff != null && diff.hunks.isNotEmpty()) {
+                    SwingUtilities.invokeLater { trackedFiles.add(fp); insertDiff(fp, diff) }
+                }
+            }.start()
+        }
+    }
+
+    private fun insertDiff(filePath: String, diff: FileDiff) {
+        val w = chatPane.width.coerceAtLeast(300) - 40
+        val added = diff.hunks.flatMap { it.addedContent }
+        val removed = diff.hunks.flatMap { it.removedContent }
+        val addCount = diff.hunks.sumOf { it.newLines }
+        val remCount = diff.hunks.sumOf { it.oldLines }
+
+        val block = JPanel(BorderLayout())
+        block.background = HunkwiseColors.SURFACE
+        block.border = BorderFactory.createLineBorder(HunkwiseColors.BORDER, 1, true)
+        block.maximumSize = Dimension(w, 350)
+
+        val content = JPanel().apply { layout = BoxLayout(this, BoxLayout.Y_AXIS); background = HunkwiseColors.SURFACE }
+        for (line in removed.take(8)) {
+            val r = JPanel(BorderLayout()).apply { background = HunkwiseColors.REMOVED_BG; border = EmptyBorder(1, 10, 1, 10); maximumSize = Dimension(w, 18) }
+            r.add(lbl("- $line", HunkwiseColors.RED, 11, false), BorderLayout.WEST); content.add(r)
+        }
+        if (removed.size > 8) content.add(lbl("  ... ${removed.size - 8} more", HunkwiseColors.MUTED, 10, false))
+        for (line in added.take(8)) {
+            val r = JPanel(BorderLayout()).apply { background = HunkwiseColors.ADDED_BG; border = EmptyBorder(1, 10, 1, 10); maximumSize = Dimension(w, 18) }
+            r.add(lbl("+ $line", HunkwiseColors.GREEN, 11, false), BorderLayout.WEST); content.add(r)
+        }
+        if (added.size > 8) content.add(lbl("  ... ${added.size - 8} more", HunkwiseColors.MUTED, 10, false))
+
+        val arrow = lbl("\u25BC", HunkwiseColors.MUTED, 9, false)
+        val header = JPanel(BorderLayout()).apply {
+            background = HunkwiseColors.SURFACE_ALT; border = EmptyBorder(6, 10, 6, 10)
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        }
+        val hL = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0)).apply { isOpaque = false }
+        hL.add(arrow); hL.add(lbl("\u270E", HunkwiseColors.MUTED, 12, false))
+        hL.add(lbl(File(filePath).name, HunkwiseColors.FG, 12, true))
+        if (addCount > 0) hL.add(lbl("+$addCount", HunkwiseColors.GREEN, 11, false))
+        if (remCount > 0) hL.add(lbl("-$remCount", HunkwiseColors.RED, 11, false))
+        header.add(hL, BorderLayout.WEST)
+        header.addMouseListener(object : java.awt.event.MouseAdapter() {
+            override fun mouseClicked(e: java.awt.event.MouseEvent) {
+                if (e.clickCount == 2) project.service<InlineDiffService>().openFileWithDiff(filePath)
+                else { content.isVisible = !content.isVisible; arrow.text = if (content.isVisible) "\u25BC" else "\u25B6"; block.revalidate() }
+            }
+        })
+        content.cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        content.addMouseListener(click { project.service<InlineDiffService>().openFileWithDiff(filePath) })
+
+        block.add(header, BorderLayout.NORTH); block.add(content, BorderLayout.CENTER)
+        insertComponent(block)
+        sessionManager.addDiffMessage(filePath, addCount, remCount)
+    }
+
+    // ── Permission denials ──────────────────────────────────────────
+
+    private fun showPermissions(denials: List<ClaudeCodeService.PermissionDenial>) {
+        val w = chatPane.width.coerceAtLeast(300) - 40
+        for (denial in denials) {
+            val desc = when (denial.toolName) {
+                "Read" -> "Read ${denial.toolInput["file_path"] ?: ""}"
+                "Write" -> "Write to ${denial.toolInput["file_path"] ?: ""}"
+                "Edit" -> "Edit ${denial.toolInput["file_path"] ?: ""}"
+                "Bash" -> "Bash command\n  ${(denial.toolInput["command"] ?: "").take(80)}"
+                "Glob" -> "Search ${denial.toolInput["pattern"] ?: ""} in ${denial.toolInput["path"] ?: ""}"
+                else -> denial.toolName
+            }
+            val block = JPanel().apply {
+                layout = BoxLayout(this, BoxLayout.Y_AXIS); background = HunkwiseColors.SURFACE
+                border = BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(HunkwiseColors.PERMISSION_BORDER, 1, true), EmptyBorder(10, 14, 10, 14))
+                maximumSize = Dimension(w, 200)
+            }
+            block.add(lbl(desc, HunkwiseColors.FG, 12, true))
+            block.add(Box.createVerticalStrut(6))
+
+            val btnRow = JPanel(FlowLayout(FlowLayout.LEFT, 8, 0)).apply { isOpaque = false }
+            val allowBtn = styledBtn("Allow", HunkwiseColors.GREEN)
+            val alwaysBtn = styledBtn("Allow always", HunkwiseColors.CYAN)
+            val denyBtn = styledBtn("Deny", HunkwiseColors.RED)
+
+            fun done(status: String, color: Color) {
+                allowBtn.isVisible = false; alwaysBtn.isVisible = false; denyBtn.isVisible = false
+                btnRow.add(lbl(status, color, 11, false))
+                block.border = BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(color, 1, true), EmptyBorder(10, 14, 10, 14))
+                block.revalidate()
+            }
+
+            fun rerun(permanent: Boolean) {
+                val saved = lastSentMessage; if (saved.isEmpty()) return
+                if (permanent) claudeService.autoAcceptCommands = true
+                isSending = true; updateBtn(); streamingBuffer.clear()
+                val doc = chatPane.styledDocument
+                if (doc.length > 0) doc.insertString(doc.length, "\n\n", null)
+                val s = chatPane.addStyle("rhdr${doc.length}", null)
+                StyleConstants.setBold(s, true); StyleConstants.setForeground(s, HunkwiseColors.SENDER_CLAUDE)
+                StyleConstants.setFontSize(s, 12); StyleConstants.setFontFamily(s, "JetBrains Mono")
+                doc.insertString(doc.length, "Claude\n", s)
+                Thread {
+                    val prev = claudeService.autoAcceptCommands
+                    if (!permanent) claudeService.autoAcceptCommands = true
+                    claudeService.sendMessageStreaming(message = saved,
+                        onToken = { t -> SwingUtilities.invokeLater { appendToken(t) } },
+                        onActivity = { a -> SwingUtilities.invokeLater { showActivity(a) } },
+                        onToolUse = { e -> SwingUtilities.invokeLater { handleTool(e) } },
+                        onPermissionDenied = { d -> SwingUtilities.invokeLater { showPermissions(d) } },
+                        onDone = { r ->
+                            if (!permanent) claudeService.autoAcceptCommands = prev
+                            SwingUtilities.invokeLater {
+                                isSending = false; updateBtn()
+                                val text = streamingBuffer.toString()
+                                if (text.isNotBlank()) sessionManager.addMessage("Claude", text)
+                                if (r.isError) appendMsg("error", r.error ?: "Error", HunkwiseColors.RED)
+                            }
+                        })
+                }.start()
+            }
+
+            allowBtn.addMouseListener(click { done("\u2713 Allowed", HunkwiseColors.GREEN); rerun(false) })
+            alwaysBtn.addMouseListener(click { done("\u2713 Always allowed", HunkwiseColors.CYAN); rerun(true) })
+            denyBtn.addMouseListener(click { done("\u2715 Denied", HunkwiseColors.RED) })
+
+            btnRow.add(allowBtn); btnRow.add(alwaysBtn); btnRow.add(denyBtn)
+            block.add(btnRow)
+            insertComponent(block)
+        }
+    }
+
+    // ── Insert component into chat ──────────────────────────────────
+
+    private fun insertComponent(comp: JPanel) {
         lastActivity = ""
         val doc = chatPane.styledDocument
         doc.insertString(doc.length, "\n", null)
         chatPane.caretPosition = doc.length
-        chatPane.insertComponent(component)
+        chatPane.insertComponent(comp)
         doc.insertString(doc.length, "\n", null)
         chatPane.caretPosition = doc.length
     }
@@ -401,13 +436,9 @@ class ReviewPanel(
 
     private fun appendMsg(sender: String, text: String, color: Color) {
         sessionManager.addMessage(sender, text)
-        appendMsgNoSave(sender, text, color)
-    }
-
-    private fun appendMsgNoSave(sender: String, text: String, color: Color) {
         val doc = chatPane.styledDocument
         if (doc.length > 0) doc.insertString(doc.length, "\n\n", null)
-        val s = chatPane.addStyle("s${doc.length}", null)
+        val s = chatPane.addStyle("msg${doc.length}", null)
         StyleConstants.setBold(s, true); StyleConstants.setForeground(s, color)
         StyleConstants.setFontSize(s, 12); StyleConstants.setFontFamily(s, "JetBrains Mono")
         doc.insertString(doc.length, "$sender\n", s)
@@ -415,67 +446,100 @@ class ReviewPanel(
         chatPane.caretPosition = doc.length
     }
 
-    // ── Sessions ────────────────────────────────────────────────────
+    // ── File change detection ───────────────────────────────────────
 
-    private fun newSession() {
-        claudeService.resetSession(); sessionManager.createNewSession()
-        chatPane.text = ""; trackedFiles.clear()
+    private fun listenForFileChanges() {
+        project.messageBus.connect(this).subscribe(VirtualFileManager.VFS_CHANGES, object : BulkFileListener {
+            override fun after(events: MutableList<out VFileEvent>) {
+                if (!isSending) return
+                for (event in events) {
+                    if (event is VFileContentChangeEvent) {
+                        val path = event.file.path; val bp = project.basePath ?: continue
+                        if (!path.startsWith(bp) || path.contains("/.git/") || path.contains("/.idea/")) continue
+                        if (trackedFiles.contains(path)) continue
+                        Thread {
+                            val diff = gitService.getFileDiff(path)
+                            if (diff != null && diff.hunks.isNotEmpty())
+                                SwingUtilities.invokeLater { trackedFiles.add(path); insertDiff(path, diff) }
+                        }.start()
+                    }
+                }
+            }
+        })
     }
 
+    // ── Sessions ────────────────────────────────────────────────────
+
+    private fun newSession() { claudeService.resetSession(); sessionManager.createNewSession(); chatPane.text = "" }
+
     private fun showHistory(anchor: Component) {
-        val sessions = sessionManager.getSessionList()
-        if (sessions.isEmpty()) return
+        val sessions = sessionManager.getSessionList(); if (sessions.isEmpty()) return
         val popup = JPopupMenu().apply { background = HunkwiseColors.SURFACE }
-        for (session in sessions.take(15)) {
-            val cur = session.id == sessionManager.getCurrentSessionId()
-            val item = JMenuItem(if (cur) "\u25CF ${session.title}" else "  ${session.title}")
+        for (sess in sessions.take(15)) {
+            val cur = sess.id == sessionManager.getCurrentSessionId()
+            val item = JMenuItem(if (cur) "\u25CF ${sess.title}" else "  ${sess.title}")
             item.font = Font("JetBrains Mono", Font.PLAIN, 11)
             item.foreground = if (cur) HunkwiseColors.GREEN else HunkwiseColors.FG
             item.background = HunkwiseColors.SURFACE
-            item.addActionListener { loadSession(session.id) }
+            item.addActionListener { loadSession(sess.id) }
             popup.add(item)
         }
         popup.show(anchor, 0, anchor.height)
     }
 
     private fun loadSession(id: String) {
-        val session = sessionManager.switchToSession(id) ?: return
+        val sess = sessionManager.switchToSession(id) ?: return
         claudeService.resetSession(); chatPane.text = ""
-        for (msg in session.messages) {
-            val color = when (msg.sender) {
-                "You" -> HunkwiseColors.SENDER_USER; "Claude" -> HunkwiseColors.SENDER_CLAUDE
-                "system" -> HunkwiseColors.SENDER_SYSTEM; "error" -> HunkwiseColors.SENDER_ERROR
-                else -> HunkwiseColors.MUTED
+        for (msg in sess.messages) {
+            when (msg.sender) {
+                "activity" -> showActivity(msg.text)
+                "diff" -> msg.filePath?.let { fp ->
+                    Thread {
+                        val diff = gitService.getFileDiff(fp)
+                        if (diff != null && diff.hunks.isNotEmpty())
+                            SwingUtilities.invokeLater { insertDiff(fp, diff) }
+                    }.start()
+                }
+                else -> {
+                    val color = when (msg.sender) {
+                        "You" -> HunkwiseColors.SENDER_USER; "Claude" -> HunkwiseColors.SENDER_CLAUDE
+                        "system" -> HunkwiseColors.SENDER_SYSTEM; "error" -> HunkwiseColors.SENDER_ERROR
+                        else -> HunkwiseColors.MUTED
+                    }
+                    val doc = chatPane.styledDocument
+                    if (doc.length > 0) doc.insertString(doc.length, "\n\n", null)
+                    val s = chatPane.addStyle("ld${doc.length}", null)
+                    StyleConstants.setBold(s, true); StyleConstants.setForeground(s, color)
+                    StyleConstants.setFontSize(s, 12); StyleConstants.setFontFamily(s, "JetBrains Mono")
+                    doc.insertString(doc.length, "${msg.sender}\n", s)
+                    MarkdownRenderer.render(chatPane, msg.text, HunkwiseColors.FG)
+                    chatPane.caretPosition = doc.length
+                }
             }
-            appendMsgNoSave(msg.sender, msg.text, color)
         }
     }
 
-    // ── Context ─────────────────────────────────────────────────────
-
-    private fun buildMessageWithHistory(msg: String): String {
-        val session = sessionManager.getCurrentSession()
-        val recent = session.messages.filter { it.sender == "You" || it.sender == "Claude" }
+    private fun buildContext(msg: String): String {
+        val sess = sessionManager.getCurrentSession()
+        val recent = sess.messages.filter { it.sender == "You" || it.sender == "Claude" }
         val sb = StringBuilder()
         if (recent.size > 1) {
             sb.appendLine("<conversation_history>")
-            for (m in recent.dropLast(1)) {
-                sb.appendLine("${if (m.sender == "You") "User" else "Assistant"}: ${m.text}\n")
-            }
+            for (m in recent.dropLast(1)) sb.appendLine("${if (m.sender == "You") "User" else "Assistant"}: ${m.text}\n")
             sb.appendLine("</conversation_history>\n")
         }
         sb.append(msg); return sb.toString()
-    }
-
-    private fun openFile(filePath: String) {
-        val vFile = LocalFileSystem.getInstance().findFileByPath(filePath) ?: return
-        FileEditorManager.getInstance(project).openFile(vFile, true)
     }
 
     override fun dispose() {}
 
     private fun lbl(t: String, c: Color, sz: Int, b: Boolean) = JLabel(t).apply {
         foreground = c; font = Font("JetBrains Mono", if (b) Font.BOLD else Font.PLAIN, sz)
+    }
+    private fun styledBtn(text: String, color: Color) = lbl(text, color, 11, false).apply {
+        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        border = BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(color, 1, true), EmptyBorder(4, 12, 4, 12))
     }
     private fun click(action: () -> Unit) = object : java.awt.event.MouseAdapter() {
         override fun mouseClicked(e: java.awt.event.MouseEvent) { action() }
